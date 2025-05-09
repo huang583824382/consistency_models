@@ -10,7 +10,18 @@ python -m orc.diffusion.scripts.train_imagenet_edm --attention_resolutions 32,16
 # Sampling from EDM models on class-conditional ImageNet-64, and LSUN 256
 #########################################################################
 
-mpiexec -n 8 python image_sample.py --training_mode edm --batch_size 64 --sigma_max 80 --sigma_min 0.002 --s_churn 0 --steps 40 --sampler heun --model_path edm_imagenet64_ema.pt --attention_resolutions 32,16,8  --class_cond True --dropout 0.1 --image_size 64 --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --num_samples 50000 --resblock_updown True --use_fp16 True --use_scale_shift_norm True --weight_schedule karras
+# distill spatial consistency model
+python cm_train.py --training_mode spatial_consistency_distillation --target_ema_mode fixed --start_ema 0.95 --scale_mode fixed --start_scales 40 --total_training_steps 600000 --loss_norm l2 --lr_anneal_steps 0 --teacher_model_path ../edm_imagenet64_ema.pt --attention_resolutions 32,16,8 --class_cond True --use_scale_shift_norm True --dropout 0.0 --teacher_dropout 0.1 --ema_rate 0.999,0.9999,0.9999432189950708 --global_batch_size 64 --image_size 64 --lr 0.000008 --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --resblock_updown True --schedule_sampler uniform --use_fp16 True --weight_decay 0.0 --weight_schedule uniform --data_dir ../datasets/ImageNet-64 --save_interval 1000
+
+# spacial sample
+# single step
+python image_sample_spacial.py --batch_size 64 --training_mode consistency_distillation --sampler onestep --model_path /mnt/afs_james/zhiwei/consistency_models/scripts/logs/openai-2025-05-08-00-26-29-526169/ema_0.999_150000.pt --steps 40 --attention_resolutions 32,16,8 --class_cond True --use_scale_shift_norm True --dropout 0.0 --image_size 64 --num_channels 192 --num_head_channels 64 --block_size 32 --num_res_blocks 3 --num_samples 64 --resblock_updown True --use_fp16 True --weight_schedule uniform --data_dir ../datasets/ImageNet-64-validate
+
+# multi step
+python image_sample_spacial.py --batch_size 64 --training_mode consistency_distillation --sampler multistep --ts 0,22,39 --model_path /mnt/afs_james/zhiwei/consistency_models/edm_imagenet64_ema.pt --steps 40 --attention_resolutions 32,16,8 --class_cond True --use_scale_shift_norm True --dropout 0.0 --image_size 64 --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --num_samples 64 --resblock_updown True --use_fp16 True --weight_schedule uniform --data_dir ../datasets/ImageNet-64-validate
+
+
+mpiexec -n 8 python image_sample.py --training_mode edm --batch_size 64 --sigma_max 80 --sigma_min 0.002 --s_churn 0 --steps 40 --sampler heun --model_path ../edm_imagenet64_ema.pt --attention_resolutions 32,16,8  --class_cond True --dropout 0.1 --image_size 64 --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --num_samples 64 --resblock_updown True --use_fp16 True --use_scale_shift_norm True --weight_schedule karras
 
 mpiexec -n 8 python image_sample.py --training_mode edm --generator determ-indiv --batch_size 8 --sigma_max 80 --sigma_min 0.002 --s_churn 0 --steps 40 --sampler heun --model_path /path/to/edm_bedroom256_ema.pt --attention_resolutions 32,16,8  --class_cond False --dropout 0.1 --image_size 256 --num_channels 256 --num_head_channels 64 --num_res_blocks 2 --num_samples 50000 --resblock_updown True --use_fp16 True --use_scale_shift_norm False --weight_schedule karras
 
@@ -43,6 +54,8 @@ mpiexec -n 8 python cm_train.py --training_mode consistency_training --target_em
 #################################################################################
 # Sampling from consistency models on class-conditional ImageNet-64, and LSUN 256
 #################################################################################
+
+
 
 ## ImageNet-64
 mpiexec -n 8 python image_sample.py --batch_size 256 --training_mode consistency_distillation --sampler onestep --model_path /path/to/checkpoint --attention_resolutions 32,16,8 --class_cond True --use_scale_shift_norm True --dropout 0.0 --image_size 64 --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --num_samples 500 --resblock_updown True --use_fp16 True --weight_schedule uniform

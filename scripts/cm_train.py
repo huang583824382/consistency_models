@@ -19,12 +19,22 @@ from cm.train_util import CMTrainLoop
 import torch.distributed as dist
 import copy
 
+import os
+os.environ['WANDB_MODE'] = 'online'
+os.environ['OPENAI_LOGDIR'] = './logs'
+
+
+import wandb
+wandb.init(project="consistency_model")
+
 
 def main():
     args = create_argparser().parse_args()
 
     dist_util.setup_dist()
     logger.configure()
+    
+    wandb.config.update(args.__dict__)
 
     logger.log("creating model and diffusion...")
     ema_scale_fn = create_ema_and_scales_fn(

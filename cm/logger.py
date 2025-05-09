@@ -49,6 +49,7 @@ class HumanOutputFormat(KVWriter, SeqWriter):
         # Create strings for printing
         key2str = {}
         for (key, val) in sorted(kvs.items()):
+            print(key, val)
             if hasattr(val, "__float__"):
                 valstr = "%-8.3g" % val
             else:
@@ -444,7 +445,10 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix=""):
     If comm is provided, average all numerical stats across that comm
     """
     if dir is None:
-        dir = os.getenv("OPENAI_LOGDIR")
+        dir = osp.join(
+            os.getenv("OPENAI_LOGDIR"),
+            datetime.datetime.now().strftime("openai-%Y-%m-%d-%H-%M-%S-%f"),
+        )
     if dir is None:
         dir = osp.join(
             tempfile.gettempdir(),

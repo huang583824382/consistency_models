@@ -7,9 +7,11 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.utils import save_image
 from piq import LPIPS
 from torchvision.transforms import RandomCrop
 from . import dist_util
+import os
 
 from .nn import mean_flat, append_dims, append_zero
 from .random_util import get_generator
@@ -237,6 +239,223 @@ class KarrasDenoiser:
         terms["loss"] = loss
 
         return terms
+    
+    
+    def spacial_consistency_losses(
+        self,
+        model,
+        x_start,
+        num_scales,
+        model_kwargs=None,
+        target_model=None,
+        teacher_model=None,
+        teacher_diffusion=None,
+        noise=None,
+        validate=False,
+        step=-1,
+        output_dir=""
+    ):
+        """
+        1. sample noise
+        2. random t
+        3. random non-uniform t' TODO
+        4. x_t = x_start + noise * t
+        5. x'_t = x_start + noise * t'
+        6. denoised = model(x_t, t)
+        7. non-uniform = model(x'_t, t')
+        8. loss = ||denoised - non-uniform||^2
+        
+        """
+        # validate=True
+        if model_kwargs is None:
+            model_kwargs = {}
+        if noise is None:
+            noise = th.randn_like(x_start)
+
+        dims = x_start.ndim
+        batch = x_start.shape[0]
+
+        def denoise_fn(x, t):
+            return self.denoise(model, x, t, **model_kwargs)[1]
+
+        if target_model:
+            @th.no_grad()
+            def target_denoise_fn(x, t):
+                return self.denoise(target_model, x, t, **model_kwargs)[1]
+
+        else:
+            raise NotImplementedError("Must have a target model")
+
+        if teacher_model:
+            @th.no_grad()
+            def teacher_denoise_fn(x, t):
+                return teacher_diffusion.denoise(teacher_model, x, t, **model_kwargs)[1]
+
+        @th.no_grad()
+        def heun_solver(samples, t, next_t, x0):
+            x = samples
+            if teacher_model is None:
+                denoiser = x0
+            else:
+                denoiser = teacher_denoise_fn(x, t)
+
+            d = (x - denoiser) / append_dims(t, dims)
+            samples = x + d * append_dims(next_t - t, dims)
+            if teacher_model is None:
+                denoiser = x0
+            else:
+                denoiser = teacher_denoise_fn(samples, next_t)
+
+            next_d = (samples - denoiser) / append_dims(next_t, dims)
+            samples = x + (d + next_d) * append_dims((next_t - t) / 2, dims)
+
+            return samples
+
+        @th.no_grad()
+        def euler_solver(samples, t, next_t, x0):
+            x = samples
+            if teacher_model is None:
+                denoiser = x0
+            else:
+                denoiser = teacher_denoise_fn(x, t)
+            d = (x - denoiser) / append_dims(t, dims)
+            samples = x + d * append_dims(next_t - t, dims)
+
+            return samples
+
+        # 1 <= indices1 <= num_scales 随机低噪声时间步
+        indices1 = th.randint(
+            1, num_scales, (x_start.shape[0],), device=x_start.device
+        ) # [B, ]
+        
+        noise_indices1 = indices1[..., None, None, None].expand(-1, -1, x_start.shape[2], x_start.shape[3]).clone() # [B, 1, H, W]
+
+        t = self.sigma_max ** (1 / self.rho) + noise_indices1 / (num_scales - 1) * (
+            self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho)
+        )
+        t = t**self.rho # [B, 1, H, W]
+
+        # 1. 随机选择mask分辨率大小，64*64 - 2*2
+        n = 2**random.randint(1, 5) # 2, 4, 8, 16, 32
+        noise_random_mask = th.rand((batch, 1, 64//n, 64//n), device=x_start.device) # [B, 1, 64//n, 64//n]
+        
+        # 2. 随机mask概率，0.3-0.7
+        noise_ratio = th.rand((batch,), device=x_start.device) * 0.4 + 0.3 # [B, ] 0.3 - 0.7
+        noise_mask = (noise_random_mask <= noise_ratio[..., None, None, None]).float() # [B, 1, 64//n, 64//n] True: 高噪声区域，False: 低噪声区域
+        
+        noise_mask = F.interpolate(noise_mask, scale_factor=n) # [B, 1, H, W]
+        
+        # 随机高噪声的时间步 0 <= indices2 <= indices1-1
+        r = th.rand((x_start.shape[0],), device=x_start.device)
+        noise_indices2 = (r[..., None, None, None]*noise_indices1).long() # [B, 1, H, W]
+        
+        # 根据mask组合noise_indices2和noise_indices1
+        noise_indices2 = noise_indices2 * noise_mask + noise_indices1 * (1 - noise_mask) # [B, 1, H, W]
+
+        t_noise = self.sigma_max ** (1 / self.rho) + noise_indices2 / (num_scales - 1) * (
+            self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho)
+        )
+        t2 = t_noise**self.rho
+
+        
+        x_t = x_start + noise * append_dims(t, dims)
+        x_t2 = x_start + noise * append_dims(t2, dims)
+        
+        # if validate:
+        #     save_image(
+        #         x_t2,
+        #         os.path.join(
+        #             output_dir,
+        #             f"x_t2_step{step}.png"
+        #         ),
+        #     )
+        #     save_image(
+        #         (x_t2+1)/2,
+        #         os.path.join(
+        #             output_dir,
+        #             f"x_t2_norm_step{step}.png"
+        #         ),
+        #     )
+        #     save_image(
+        #         t2/t2.max(),
+        #         os.path.join(
+        #             output_dir,
+        #             f"t2_step{step}.png"
+        #         ),
+        #     )
+        #     save_image(
+        #         noise_mask,
+        #         os.path.join(
+        #             output_dir,
+        #             f"noise_mask{step}.png"
+        #         ),
+        #     )
+        #     save_image(
+        #         noise_indices2/40,
+        #         os.path.join(
+        #             output_dir,
+        #             f"noise_indices2{step}.png"
+        #         ),
+        #     )
+        #     save_image(
+        #         noise_indices1/40,
+        #         os.path.join(
+        #             output_dir,
+        #             f"noise_indices1{step}.png"
+        #         ),
+        #     )
+        #     exit(0)
+        
+        dropout_state = th.get_rng_state()
+        th.set_rng_state(dropout_state)
+        
+        distiller = denoise_fn(x_t2, t2)
+        # distiller_target = target_denoise_fn(x_t, t)
+        distiller_target = teacher_denoise_fn(x_t, t)
+        distiller_target = distiller_target.detach()
+
+        # [B, ] 保留原始的snr shape, 加噪越多，snr越小，weights越小
+        # 所以加噪越小，越需要图片能够补全缺失部分
+        snrs = self.get_snr(t2) 
+        weights = mean_flat(get_weightings(self.weight_schedule, snrs, self.sigma_data))
+        
+        if self.loss_norm == "l1":
+            diffs = th.abs(distiller - distiller_target)
+            loss = mean_flat(diffs) * weights
+        elif self.loss_norm == "l2":
+            diffs = (distiller - distiller_target) ** 2
+            loss = mean_flat(diffs) * weights
+        elif self.loss_norm == "l2-32":
+            distiller = F.interpolate(distiller, size=32, mode="bilinear")
+            distiller_target = F.interpolate(
+                distiller_target,
+                size=32,
+                mode="bilinear",
+            )
+            diffs = (distiller - distiller_target) ** 2
+            loss = mean_flat(diffs) * weights
+        elif self.loss_norm == "lpips":
+            if x_start.shape[-1] < 256:
+                distiller = F.interpolate(distiller, size=224, mode="bilinear")
+                distiller_target = F.interpolate(
+                    distiller_target, size=224, mode="bilinear"
+                )
+
+            loss = (
+                self.lpips_loss(
+                    (distiller + 1) / 2.0,
+                    (distiller_target + 1) / 2.0,
+                )
+                * weights
+            )
+        else:
+            raise ValueError(f"Unknown loss norm {self.loss_norm}")
+
+        terms = {}
+        terms["loss"] = loss
+
+        return terms
+        
 
     def progdist_losses(
         self,
@@ -332,8 +551,10 @@ class KarrasDenoiser:
         return terms
 
     def denoise(self, model, x_t, sigmas, **model_kwargs):
+        # 1. 支持输入image shape c_skip
+        # 2. 支持输入image shape sigmas
         import torch.distributed as dist
-
+        # sigmas: [B, 1, H, W]
         if not self.distillation:
             c_skip, c_out, c_in = [
                 append_dims(x, x_t.ndim) for x in self.get_scalings(sigmas)
@@ -344,6 +565,7 @@ class KarrasDenoiser:
                 for x in self.get_scalings_for_boundary_condition(sigmas)
             ]
         rescaled_t = 1000 * 0.25 * th.log(sigmas + 1e-44)
+        # print("c_in.shape, x_t.shape, rescaled_t.shape", c_in.shape, x_t.shape, rescaled_t.shape)
         model_output = model(c_in * x_t, rescaled_t, **model_kwargs)
         denoised = c_out * model_output + c_skip * x_t
         return model_output, denoised
@@ -387,6 +609,7 @@ def karras_sample(
         "onestep": sample_onestep,
         "progdist": sample_progdist,
         "euler": sample_euler,
+        "euler_spacial": sample_euler_spacial,
         "multistep": stochastic_iterative_sampler,
     }[sampler]
 
@@ -417,6 +640,112 @@ def karras_sample(
         **sampler_args,
     )
     return x_0.clamp(-1, 1)
+
+
+def karras_sample_spacial(
+    diffusion,
+    model,
+    x_start,
+    shape,
+    steps,
+    clip_denoised=True,
+    progress=False,
+    callback=None,
+    model_kwargs=None,
+    device=None,
+    sigma_min=0.002,
+    sigma_max=80,  # higher for highres?
+    rho=7.0,
+    sampler="heun",
+    s_churn=0.0,
+    s_tmin=0.0,
+    s_tmax=float("inf"),
+    s_noise=1.0,
+    generator=None,
+    ts=None,
+    block_size=16,
+    step_num=1,
+):
+    
+    if generator is None:
+        generator = get_generator("dummy")
+
+    # if sampler == "progdist":
+    #     sigmas = get_sigmas_karras(steps + 1, sigma_min, sigma_max, rho, device=device)
+    # else:
+    #     sigmas = get_sigmas_karras(steps, sigma_min, sigma_max, rho, device=device)
+    batch = x_start.shape[0]
+    noise = generator.randn_like(x_start)
+    num_scales = steps
+    # 1 <= indices1 <= num_scales-1
+    indices1 = generator.randint(
+        1, num_scales, (x_start.shape[0],), device=x_start.device
+    )
+    
+    indices1 = th.ones_like(indices1, device=x_start.device)*39
+    
+    n = block_size
+    noise_indices = indices1[..., None, None, None].expand(-1, -1, x_start.shape[2], x_start.shape[3]).clone() # [B, 1, H, W]
+    block_start = generator.randint(0, 63 - n, (batch, 2), device=x_start.device) # [B, 2]: x, y
+    r = generator.rand((x_start.shape[0],), device=x_start.device)
+    # # 0 <= indices2 <= indices1-1
+    indices2 = (r*indices1).long() # [B, ]
+    indices2 = th.ones_like(indices2, device=x_start.device)*0
+    
+    for b in range(batch):
+        noise_indices[ b, :, block_start[b, 0]:block_start[b, 0]+n, block_start[b, 1]:block_start[b, 1]+n] = indices2[b]
+        
+    t2 = (sigma_max ** (1 / rho) + noise_indices / (num_scales - 1) * (
+            sigma_min ** (1 / rho) - sigma_max ** (1 / rho)
+        ))**rho
+    
+    x_t2 = x_start + noise * t2
+    
+    sigmas = t2 # t2的算法就是求解sigmas
+    
+    
+    sample_fn = {
+        "heun": sample_heun,
+        "dpm": sample_dpm,
+        "ancestral": sample_euler_ancestral,
+        "onestep": sample_onestep_spacial,
+        "progdist": sample_progdist,
+        "euler": sample_euler,
+        "euler_spacial": sample_euler_spacial,
+        "multistep": stochastic_iterative_sampler_spacial,
+    }[sampler]
+
+    if sampler in ["heun", "dpm"]:
+        sampler_args = dict(
+            s_churn=s_churn, s_tmin=s_tmin, s_tmax=s_tmax, s_noise=s_noise
+        )
+    elif sampler == "multistep":
+        sampler_args = dict(
+            noise_indices=noise_indices.cpu().numpy(), t_num=step_num, t_min=sigma_min, t_max=sigma_max, rho=diffusion.rho, steps=steps
+        )
+    else:
+        sampler_args = {}
+
+    def denoiser(x_t, sigma):
+        # print("in denoiser x_t.shape, sigma.shape", x_t.shape, sigma.shape)
+        _, denoised = diffusion.denoise(model, x_t, sigma, **model_kwargs)
+        if clip_denoised:
+            denoised = denoised.clamp(-1, 1)
+        return denoised
+
+    # print("x_t2.shape, sigmas.shape", x_t2.shape, sigmas.shape)
+    
+    x_0 = sample_fn(
+        denoiser,
+        x_t2,
+        sigmas,
+        generator,
+        progress=progress,
+        callback=callback,
+        **sampler_args,
+    )
+    return x_0.clamp(-1, 1), x_t2.clamp(-1, 1), noise_indices / steps * 2 - 1
+
 
 
 def get_sigmas_karras(n, sigma_min, sigma_max, rho=7.0, device="cpu"):
@@ -524,7 +853,7 @@ def sample_heun(
         sigma_hat = sigmas[i] * (gamma + 1)
         if gamma > 0:
             x = x + eps * (sigma_hat**2 - sigmas[i] ** 2) ** 0.5
-        denoised = denoiser(x, sigma_hat * s_in)
+        denoised = denoiser(x, (sigma_hat * s_in)[..., None, None, None].expand(-1, -1, x.shape[2], x.shape[3]))
         d = to_d(x, sigma_hat, denoised)
         if callback is not None:
             callback(
@@ -584,6 +913,50 @@ def sample_euler(
         x = x + d * dt
     return x
 
+@th.no_grad()
+def sample_euler_spacial(
+    denoiser,
+    x,
+    sigmas,
+    generator,
+    progress=False,
+    callback=None,
+):
+    """Implements Algorithm 2 (Heun steps) from Karras et al. (2022)."""
+    s_in = x.new_ones([x.shape[0]])
+    # print("s_in:", s_in)
+    indices = range(len(sigmas) - 1)
+    if progress:
+        from tqdm.auto import tqdm
+        indices = tqdm(indices)
+
+    # d: [b, 3, h, w]
+    # step_start: [b, 1, h, w]
+    # step_end: [b, 1, h, w]
+    # 求解出来的dt_spacial: [b, 1, h, w]
+    
+    for i in indices:
+        step_start = th.ones(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device) * i
+        step_end = th.ones(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device) * (i + 1)
+
+        sigma_start = sigmas[step_start.long()]
+        sigma_end = sigmas[step_end.long()]
+
+        denoised = denoiser(x, sigma_start * s_in) # TODO 修改为传入不同的时间步信息
+        d = to_d(x, sigma_start, denoised) # 计算ODE导数
+
+        if callback is not None:
+            callback(
+                {
+                    "x": x,
+                    "i": i,
+                    "sigma": sigmas[i],
+                    "denoised": denoised,
+                }
+            )
+        dt = sigma_end - sigma_start # 步长
+        x = x + d * dt # 欧拉步更新
+    return x
 
 @th.no_grad()
 def sample_dpm(
@@ -652,6 +1025,19 @@ def sample_onestep(
     s_in = x.new_ones([x.shape[0]])
     return distiller(x, sigmas[0] * s_in)
 
+@th.no_grad()
+def sample_onestep_spacial(
+    distiller,
+    x,
+    sigmas,
+    generator=None,
+    progress=False,
+    callback=None,
+):
+    """Single-step generation from a distilled model."""
+    s_in = x.new_ones([x.shape[0]])
+    return distiller(x, sigmas * s_in)
+
 
 @th.no_grad()
 def stochastic_iterative_sampler(
@@ -678,6 +1064,43 @@ def stochastic_iterative_sampler(
         next_t = np.clip(next_t, t_min, t_max)
         x = x0 + generator.randn_like(x) * np.sqrt(next_t**2 - t_min**2)
 
+    return x
+
+
+@th.no_grad()
+def stochastic_iterative_sampler_spacial(
+    distiller,
+    x,
+    sigmas,
+    generator,
+    noise_indices,
+    t_num,
+    progress=False,
+    callback=None,
+    t_min=0.002,
+    t_max=80.0,
+    rho=7.0,
+    steps=40,
+):
+    # 输入的x为原始图像
+    step_num = t_num
+    t_max_rho = t_max ** (1 / rho)
+    t_min_rho = t_min ** (1 / rho)
+    s_in = x.new_ones([x.shape[0]])
+    step_indices = (np.ones_like(noise_indices) * (steps-1) - noise_indices) / (step_num)
+
+    for i in range(step_num):
+        sigmas = th.tensor((t_max_rho + np.round(noise_indices).astype(int) / (steps - 1) * (t_min_rho - t_max_rho))**rho, device=x.device, dtype=x.dtype)
+        x0 = distiller(x, sigmas * s_in)
+        
+        # 按照等分，将noise_indices到steps-1分为step_num份
+        
+        print(f"noise_indices {i}:", noise_indices[0].min())
+        noise_indices = (noise_indices + step_indices)
+        print(f"next_noise_indices {i}:", noise_indices[0].min())
+        next_t = (t_max_rho + np.round(noise_indices).astype(int) / (steps - 1) * (t_min_rho - t_max_rho)) ** rho
+        next_t = np.clip(next_t, t_min, t_max)
+        x = x0 + generator.randn_like(x) * th.tensor(np.sqrt(next_t**2 - t_min**2), device=x.device, dtype=x.dtype)
     return x
 
 

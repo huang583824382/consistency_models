@@ -16,6 +16,7 @@ from .nn import (
     zero_module,
     normalization,
     timestep_embedding,
+    timestep_embedding_pw,
 )
 
 
@@ -190,11 +191,14 @@ class ResBlock(TimestepBlock):
         if up:
             self.h_upd = Upsample(channels, False, dims)
             self.x_upd = Upsample(channels, False, dims)
+            self.t_upd = Upsample(emb_channels, False, dims)
         elif down:
             self.h_upd = Downsample(channels, False, dims)
             self.x_upd = Downsample(channels, False, dims)
+            self.t_upd = Downsample(emb_channels, False, dims)
         else:
-            self.h_upd = self.x_upd = nn.Identity()
+            self.h_upd = self.x_upd = self.t_upd = nn.Identity()
+            
 
         self.emb_layers = nn.Sequential(
             nn.SiLU(),
@@ -239,10 +243,17 @@ class ResBlock(TimestepBlock):
             h = in_rest(x)
             h = self.h_upd(h)
             x = self.x_upd(x)
+            # print("before t_upd:", emb.mean())
+            emb = self.t_upd(emb)
+            # print("after t_upd:", emb.mean())
             h = in_conv(h)
         else:
             h = self.in_layers(x)
-        emb_out = self.emb_layers(emb).type(h.dtype)
+        # emb = emb[..., None, None].expand(-1, -1, *h.shape[2:])  # [B, C, H, W]
+        emb_out = self.emb_layers(emb.permute(0, 2, 3, 1)).type(h.dtype).permute(0, 3, 1, 2)
+        # emb_out = emb_out[..., None, None].expand( -1, -1, *h.shape[2:]) # [B, C, H, W]
+        # print("emb_out.shape:", emb_out.shape)
+        # emb_out = emb_out.permute(0, 3, 1, 2)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
@@ -341,7 +352,7 @@ class QKVFlashAttention(nn.Module):
         **kwargs,
     ) -> None:
         from einops import rearrange
-        from flash_attn.flash_attention import FlashAttention
+        from flash_attn import flash_attn_func
 
         assert batch_first
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -349,6 +360,7 @@ class QKVFlashAttention(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.causal = causal
+        self.attention_dropout = attention_dropout
 
         assert (
             self.embed_dim % num_heads == 0
@@ -356,19 +368,20 @@ class QKVFlashAttention(nn.Module):
         self.head_dim = self.embed_dim // num_heads
         assert self.head_dim in [16, 32, 64], "Only support head_dim == 16, 32, or 64"
 
-        self.inner_attn = FlashAttention(
-            attention_dropout=attention_dropout, **factory_kwargs
-        )
+        self.inner_attn = flash_attn_func
         self.rearrange = rearrange
 
     def forward(self, qkv, attn_mask=None, key_padding_mask=None, need_weights=False):
         qkv = self.rearrange(
             qkv, "b (three h d) s -> b s three h d", three=3, h=self.num_heads
         )
-        qkv, _ = self.inner_attn(
-            qkv,
-            key_padding_mask=key_padding_mask,
-            need_weights=need_weights,
+        q, k, v = qkv.chunk(3, dim=2)
+        q = q.squeeze(2)
+        k = k.squeeze(2)
+        v = v.squeeze(2)
+        qkv = self.inner_attn(
+            q, k, v,
+            dropout_p=self.attention_dropout,
             causal=self.causal,
         )
         return self.rearrange(qkv, "b s h d -> b (h d) s")
@@ -767,18 +780,40 @@ class UNetModel(nn.Module):
         ), "must specify y if and only if the model is class-conditional"
 
         hs = []
-        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+        # print(timesteps.shape) # (B, )
+        # emb = timestep_embedding(timesteps, self.model_channels) # B, C
+        # emb = emb[..., None, None].expand(-1, -1, x.shape[2], x.shape[3]) # B, C, H, W
+        # print("emb_raw:", emb_raw.mean())
+        # timesteps = timesteps[..., None, None].expand(-1, x.shape[2], x.shape[3]) # (B, 1, H, W)
+        emb = timestep_embedding_pw(timesteps, self.model_channels) # B, C, H, W
+        # print("emb == emb_raw:", emb.mean() == emb_raw.mean())
+        # if emb.mean() != emb_raw.mean():
+        #     print("unequal")
+        #     print("emb_raw:", emb_raw)
+        #     print("emb:", emb)
+        #     exit(0)
+        # print(emb.shape)
+        emb = self.time_embed(emb.permute(0, 2, 3, 1)).permute(0, 3, 1, 2) # [B, C, H, W]
+        # print(emb.shape)
+        # emb = emb[:, 0, 0, :]
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)
+            emb = emb + self.label_emb(y)[:, :, None, None] # [B, C, H, W]
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
+            if h.shape[2] != emb.shape[2]: 
+                # print(f"interpolate emb {emb.shape[2:]} to {h.shape[2:]}")
+                emb = F.interpolate(emb, size=h.shape[2:], mode="bilinear")
+                # print(emb.shape)
+            # h: [B, C, H, W], emb: [B, C, H, W]
             h = module(h, emb)
             hs.append(h)
         h = self.middle_block(h, emb)
         for module in self.output_blocks:
+            if h.shape[2] != emb.shape[2]: 
+                emb = F.interpolate(emb, size=h.shape[2:], mode="bilinear")
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         h = h.type(x.dtype)

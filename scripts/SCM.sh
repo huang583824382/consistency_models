@@ -1,0 +1,10 @@
+# Train SCM
+python cm_train.py --training_mode spatial_consistency_distillation --target_ema_mode fixed --start_ema 0.95 --scale_mode fixed --start_scales 40 --total_training_steps 600000 --loss_norm l2 --lr_anneal_steps 0 --teacher_model_path ../edm_imagenet64_ema.pt --attention_resolutions 32,16,8 --class_cond True --use_scale_shift_norm True --dropout 0.0 --teacher_dropout 0.1 --ema_rate 0.999,0.9999,0.9999432189950708 --global_batch_size 64 --image_size 64 --lr 0.000008 --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --resblock_updown True --schedule_sampler uniform --use_fp16 True --weight_decay 0.0 --weight_schedule uniform --data_dir ../datasets/ImageNet-64 --save_interval 10000
+
+
+# Sample SCM one step
+python image_sample_spacial.py --batch_size 64 --training_mode consistency_distillation --sampler onestep --model_path /mnt/afs_james/zhiwei/consistency_models/scripts/logs/openai-2025-05-08-00-26-29-526169/ema_0.999_150000.pt --steps 40 --attention_resolutions 32,16,8 --class_cond True --use_scale_shift_norm True --dropout 0.0 --image_size 64 --num_channels 192 --num_head_channels 64 --block_size 32 --num_res_blocks 3 --num_samples 64 --resblock_updown True --use_fp16 True --weight_schedule uniform --data_dir ../datasets/ImageNet-64-validate
+
+
+# Sample multi steps
+python image_sample_spacial.py --batch_size 64 --training_mode consistency_distillation --sampler multistep --model_path /mnt/afs_james/zhiwei/consistency_models/scripts/logs/openai-2025-05-08-00-26-29-526169/ema_0.999_150000.pt --steps 40 --attention_resolutions 32,16,8 --class_cond True --use_scale_shift_norm True --dropout 0.0 --image_size 64 --num_channels 192 --num_head_channels 64 --block_size 16 --num_res_blocks 3 --num_samples 64 --resblock_updown True --use_fp16 True --weight_schedule uniform --data_dir ../datasets/ImageNet-64-validate --step_num 8

@@ -5,12 +5,14 @@ numpy array. This can be used to produce samples for FID evaluation.
 
 import argparse
 import os
+os.environ['OPENAI_LOGDIR'] = './logs'
 
 import numpy as np
 import torch as th
 import torch.distributed as dist
 from torchvision.utils import save_image
 from matplotlib import pyplot as plt
+from cm.image_datasets import load_data
 
 from cm import dist_util, logger
 from cm.script_util import (
@@ -21,12 +23,20 @@ from cm.script_util import (
     args_to_dict,
 )
 from cm.random_util import get_generator
-from cm.karras_diffusion import karras_sample
+from cm.karras_diffusion import karras_sample, karras_sample_spacial
 
 
 def main():
     args = create_argparser().parse_args()
-
+    data = load_data(
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        image_size=args.image_size,
+        class_cond=args.class_cond,
+        random_flip=False,
+        deterministic=True
+    )
+    
     dist_util.setup_dist()
     logger.configure(dir="sample")
 
@@ -49,27 +59,37 @@ def main():
     model.eval()
 
     logger.log("sampling...")
-    if args.sampler == "multistep":
-        assert len(args.ts) > 0
-        ts = tuple(int(x) for x in args.ts.split(","))
-    else:
-        ts = None
+    # if args.sampler == "multistep":
+    #     assert len(args.ts) > 0
+    #     ts = tuple(int(x) for x in args.ts.split(","))
+    # else:
+    #     ts = None
+    ts = None
+
 
     all_images = []
     all_labels = []
     generator = get_generator(args.generator, args.num_samples, args.seed)
 
     # while len(all_images) * args.batch_size < args.num_samples:
-    model_kwargs = {}
-    if args.class_cond:
-        classes = th.randint(
-            low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
-        )
-        model_kwargs["y"] = classes
+    # model_kwargs = {}
+    # if args.class_cond:
+    #     classes = th.randint(
+    #         low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
+    #     )
+    #     model_kwargs["y"] = classes
 
-    sample = karras_sample(
+    imgs, cond = next(data)
+    imgs = imgs.cuda()
+    model_kwargs = {
+        k: v.cuda()
+        for k, v in cond.items()
+    }
+    
+    sample, input_noised, noise_weight = karras_sample_spacial(
         diffusion,
         model,
+        imgs,
         (args.batch_size, 3, args.image_size, args.image_size),
         steps=args.steps,
         model_kwargs=model_kwargs,
@@ -84,17 +104,38 @@ def main():
         s_noise=args.s_noise,
         generator=generator,
         ts=ts,
+        block_size=args.block_size,
+        step_num=args.step_num
     )
     sample = ((sample + 1) / 2)
+    input_noised = ((input_noised + 1) / 2)
+    imgs = ((imgs + 1) / 2)
     # sample = sample.permute(0, 2, 3, 1)
     sample = sample.contiguous()
     save_image(
         sample,
         os.path.join(
-            "sample_debug.png"
+            f"sample_spacial_{args.sampler}.png"
         ),
     )  # Save the sample as a single image for testing purposes
-
+    save_image(
+        input_noised,
+        os.path.join(
+            f"input_noised_spacial_{args.sampler}.png"
+        ),
+    )
+    save_image(
+        noise_weight,
+        os.path.join(
+            f"noise_weight_spacial_{args.sampler}.png"
+        ),
+    )
+    save_image(
+        imgs,
+        os.path.join(
+            f"imgs_gt_spacial_{args.sampler}.png"
+        ),
+    )
     # gathered_samples = [th.zeros_like(sample) for _ in range(dist.get_world_size())]
     # dist.all_gather(gathered_samples, sample)  # gather not supported with NCCL
     # all_images.extend([sample.cpu().numpy() for sample in gathered_samples])
@@ -137,6 +178,9 @@ def create_argparser():
         model_path="",
         seed=42,
         ts="",
+        data_dir="",
+        block_size=16,
+        step_num=4,
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

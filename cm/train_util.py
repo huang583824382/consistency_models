@@ -19,6 +19,7 @@ from .fp16_util import (
     master_params_to_model_params,
 )
 import numpy as np
+import wandb
 
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
@@ -485,9 +486,31 @@ class CMTrainLoop(TrainLoop):
                     teacher_diffusion=self.teacher_diffusion,
                     model_kwargs=micro_cond,
                 )
+            elif self.training_mode == "spatial_consistency_distillation":
+                compute_losses = functools.partial(
+                    self.diffusion.spacial_consistency_losses,
+                    self.ddp_model,
+                    micro,
+                    num_scales,
+                    target_model=self.target_model,
+                    teacher_model=self.teacher_model,
+                    teacher_diffusion=self.teacher_diffusion,
+                    model_kwargs=micro_cond,
+                )
             elif self.training_mode == "consistency_training":
                 compute_losses = functools.partial(
                     self.diffusion.consistency_losses,
+                    self.ddp_model,
+                    micro,
+                    num_scales,
+                    target_model=self.target_model,
+                    model_kwargs=micro_cond,
+                )
+            elif self.training_mode == "spatial_consistency_training":
+                del self.teacher_model
+                self.teacher_model = None
+                compute_losses = functools.partial(
+                    self.diffusion.spacial_consistency_losses,
                     self.ddp_model,
                     micro,
                     num_scales,
@@ -509,6 +532,7 @@ class CMTrainLoop(TrainLoop):
                 )
 
             loss = (losses["loss"] * weights).mean()
+            wandb.log({"total_loss": loss})
 
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}

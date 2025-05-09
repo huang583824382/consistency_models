@@ -76,6 +76,11 @@ class DeterministicGenerator:
         return th.randint(
             low, high, generator=generator, size=global_size, dtype=dtype, device=device
         )[indices]
+        
+    def rand(self, size, dtype=th.float, device="cpu"):
+        global_size, indices = self.get_global_size_and_indices(size)
+        generator = self.get_generator(device)
+        return th.rand(global_size, generator=generator, dtype=dtype, device=device)[indices]
 
     def randn_like(self, tensor):
         size, dtype, device = tensor.size(), tensor.dtype, tensor.device
