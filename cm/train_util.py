@@ -452,7 +452,7 @@ class CMTrainLoop(TrainLoop):
             }
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
-
+            print(micro_cond)
             ema, num_scales = self.ema_scale_fn(self.global_step)
             if self.training_mode == "progdist":
                 if num_scales == self.ema_scale_fn(0)[1]:

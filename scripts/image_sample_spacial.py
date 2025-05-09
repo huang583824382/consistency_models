@@ -25,16 +25,30 @@ from cm.script_util import (
 from cm.random_util import get_generator
 from cm.karras_diffusion import karras_sample, karras_sample_spacial
 
+def seed_everything(seed):
+    """
+    Set the seed for all random number generators to ensure reproducibility.
+    """
+    th.manual_seed(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    if th.cuda.is_available():
+        th.cuda.manual_seed_all(seed)
+        th.backends.cudnn.deterministic = True
+        th.backends.cudnn.benchmark = False
 
 def main():
     args = create_argparser().parse_args()
+    # print(args.class_cond)
+    seed_everything(0)
     data = load_data(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         image_size=args.image_size,
         class_cond=args.class_cond,
         random_flip=False,
-        deterministic=True
+        deterministic=False
     )
     
     dist_util.setup_dist()
@@ -80,6 +94,7 @@ def main():
     #     model_kwargs["y"] = classes
 
     imgs, cond = next(data)
+    print(cond)
     imgs = imgs.cuda()
     model_kwargs = {
         k: v.cuda()
@@ -105,7 +120,9 @@ def main():
         generator=generator,
         ts=ts,
         block_size=args.block_size,
-        step_num=args.step_num
+        step_num=args.step_num,
+        light_noise_indice=args.light_noise_indice,
+        heavy_noise_indice=args.heavy_noise_indice,
     )
     sample = ((sample + 1) / 2)
     input_noised = ((input_noised + 1) / 2)
@@ -181,6 +198,9 @@ def create_argparser():
         data_dir="",
         block_size=16,
         step_num=4,
+        class_cond=False,
+        light_noise_indice=30,
+        heavy_noise_indice=0,
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

@@ -20,4 +20,4 @@ dist/
 # Other
 *.DS_Store
 
-datasets/
+datasets/ImageNet*

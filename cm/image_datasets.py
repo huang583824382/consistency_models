@@ -43,8 +43,11 @@ def load_data(
     if class_cond:
         # Assume classes are the first part of the filename,
         # before an underscore.
+        # TODO 更改为从category file中读取
         class_names = [bf.basename(path).split("_")[0] for path in all_files]
-        sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+        # sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+        import json
+        sorted_classes = json.load(open(f"{data_dir}/../class_map.json", "r"))
         classes = [sorted_classes[x] for x in class_names]
     dataset = ImageDataset(
         image_size,

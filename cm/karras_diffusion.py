@@ -665,6 +665,8 @@ def karras_sample_spacial(
     ts=None,
     block_size=16,
     step_num=1,
+    light_noise_indice=39,
+    heavy_noise_indice=0,
 ):
     
     if generator is None:
@@ -682,7 +684,10 @@ def karras_sample_spacial(
         1, num_scales, (x_start.shape[0],), device=x_start.device
     )
     
-    indices1 = th.ones_like(indices1, device=x_start.device)*39
+    # light_noise_indice = 30
+    # heavy_noise_indice = 0
+    
+    indices1 = th.ones_like(indices1, device=x_start.device) * light_noise_indice
     
     n = block_size
     noise_indices = indices1[..., None, None, None].expand(-1, -1, x_start.shape[2], x_start.shape[3]).clone() # [B, 1, H, W]
@@ -690,7 +695,7 @@ def karras_sample_spacial(
     r = generator.rand((x_start.shape[0],), device=x_start.device)
     # # 0 <= indices2 <= indices1-1
     indices2 = (r*indices1).long() # [B, ]
-    indices2 = th.ones_like(indices2, device=x_start.device)*0
+    indices2 = th.ones_like(indices2, device=x_start.device) * heavy_noise_indice
     
     for b in range(batch):
         noise_indices[ b, :, block_start[b, 0]:block_start[b, 0]+n, block_start[b, 1]:block_start[b, 1]+n] = indices2[b]
@@ -713,13 +718,14 @@ def karras_sample_spacial(
         "euler": sample_euler,
         "euler_spacial": sample_euler_spacial,
         "multistep": stochastic_iterative_sampler_spacial,
+        "scm": scm_sampler_spacial,
     }[sampler]
 
     if sampler in ["heun", "dpm"]:
         sampler_args = dict(
             s_churn=s_churn, s_tmin=s_tmin, s_tmax=s_tmax, s_noise=s_noise
         )
-    elif sampler == "multistep":
+    elif sampler == "multistep" or sampler == "scm":
         sampler_args = dict(
             noise_indices=noise_indices.cpu().numpy(), t_num=step_num, t_min=sigma_min, t_max=sigma_max, rho=diffusion.rho, steps=steps
         )
@@ -1087,7 +1093,7 @@ def stochastic_iterative_sampler_spacial(
     t_max_rho = t_max ** (1 / rho)
     t_min_rho = t_min ** (1 / rho)
     s_in = x.new_ones([x.shape[0]])
-    step_indices = (np.ones_like(noise_indices) * (steps-1) - noise_indices) / (step_num)
+    step_indices = (np.ones_like(noise_indices) * (steps - 1) - noise_indices) / (step_num)
 
     for i in range(step_num):
         sigmas = th.tensor((t_max_rho + np.round(noise_indices).astype(int) / (steps - 1) * (t_min_rho - t_max_rho))**rho, device=x.device, dtype=x.dtype)
@@ -1095,12 +1101,55 @@ def stochastic_iterative_sampler_spacial(
         
         # 按照等分，将noise_indices到steps-1分为step_num份
         
-        print(f"noise_indices {i}:", noise_indices[0].min())
+        print(f"noise_indices {i}:", noise_indices[0].min(), noise_indices[0].max())
         noise_indices = (noise_indices + step_indices)
-        print(f"next_noise_indices {i}:", noise_indices[0].min())
+        print(f"next_noise_indices {i}:", noise_indices[0].min(), noise_indices[0].max())
         next_t = (t_max_rho + np.round(noise_indices).astype(int) / (steps - 1) * (t_min_rho - t_max_rho)) ** rho
         next_t = np.clip(next_t, t_min, t_max)
         x = x0 + generator.randn_like(x) * th.tensor(np.sqrt(next_t**2 - t_min**2), device=x.device, dtype=x.dtype)
+    return x
+
+
+@th.no_grad()
+def scm_sampler_spacial(
+    distiller,
+    x,
+    sigmas,
+    generator,
+    noise_indices: np.ndarray,
+    t_num,
+    progress=False,
+    callback=None,
+    t_min=0.002,
+    t_max=80.0,
+    rho=7.0,
+    steps=40,
+):
+    # 输入的x为原始图像
+    step_num = t_num # 高噪声区域t_num步推到低噪声区域
+    t_max_rho = t_max ** (1 / rho)
+    t_min_rho = t_min ** (1 / rho)
+    s_in = x.new_ones([x.shape[0]])
+    
+    # 获取每一个batch中的最大值 [B,]
+    light_noise_indices = noise_indices.max(axis=(1, 2, 3)) # [B,]
+    heavy_noise_indices = noise_indices.min(axis=(1, 2, 3)) # [B,]
+
+    mask = th.tensor(noise_indices < light_noise_indices[:, None, None, None], device=x.device, dtype=x.dtype) # [B, 1, H, W]
+    
+    # 单步去噪
+    sigmas = th.tensor((t_max_rho + np.round(noise_indices).astype(int) / (steps - 1) * (t_min_rho - t_max_rho))**rho, device=x.device, dtype=x.dtype)
+    x0 = distiller(x, sigmas * s_in)
+    
+    light_t = (t_max_rho + np.ones_like(noise_indices) * light_noise_indices / (steps - 1) * (t_min_rho - t_max_rho)) ** rho
+    
+    x = (x0 + generator.randn_like(x) * th.tensor(np.sqrt(light_t**2 - t_min**2), device=x.device, dtype=x.dtype)) * mask + x * (1 - mask) # 得到的是light indice时间步
+    
+    # 至此时间步对齐，一步去噪-------------------------
+    # TODO 多步去噪？
+    sigmas = th.tensor(light_t, device=x.device, dtype=x.dtype)
+    x = distiller(x, sigmas * s_in)
+
     return x
 
 
